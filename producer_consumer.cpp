@@ -15,9 +15,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/ipc.h>
-#include <sys/shm.h>
+#include <pthread.h>
 #include <semaphore.h>
 
 //***************************************************************************
@@ -30,7 +28,7 @@
 #define SEM_FULL_NAME       "/sem_full"
 
 //***************************************************************************
-// shared memory structure
+// shared data structure
 
 struct shared_data 
 {
@@ -46,8 +44,7 @@ sem_t *g_sem_mutex = nullptr;    // controls access to critical region
 sem_t *g_sem_empty = nullptr;    // counts empty buffer slots
 sem_t *g_sem_full = nullptr;     // counts full buffer slots
 
-struct shared_data *g_shared = nullptr;  // pointer to shared memory
-int g_shmid = -1;                        // shared memory ID
+struct shared_data g_shared;     // shared data (global for threads)
 
 //***************************************************************************
 // log messages
@@ -96,12 +93,6 @@ void clean(void)
 {
     log_msg(LOG_INFO, "Final cleaning ...");
 
-    // detach shared memory
-    if (g_shared)
-    {
-        shmdt(g_shared);
-    }
-
     // clean semaphores
     if (g_sem_mutex)
     {
@@ -119,12 +110,6 @@ void clean(void)
     {
         sem_close(g_sem_full);
         sem_unlink(SEM_FULL_NAME);
-    }
-
-    // remove shared memory
-    if (g_shmid >= 0)
-    {
-        shmctl(g_shmid, IPC_RMID, nullptr);
     }
 }
 
@@ -183,14 +168,14 @@ int produce_item( void )
 
 void insert_item( int item )
 {
-    g_shared->buffer[ g_shared->in ] = item;
-    g_shared->in = ( g_shared->in + 1 ) % N;
+    g_shared.buffer[ g_shared.in ] = item;
+    g_shared.in = ( g_shared.in + 1 ) % N;
 }
 
 int remove_item( void )
 {
-    int item = g_shared->buffer[ g_shared->out ];
-    g_shared->out = ( g_shared->out + 1 ) % N;
+    int item = g_shared.buffer[ g_shared.out ];
+    g_shared.out = ( g_shared.out + 1 ) % N;
     return item;
 }
 
@@ -202,11 +187,11 @@ void consume_item( int item )
 //***************************************************************************
 // PRODUCER function from Figure 2-28
 
-void producer( void )
+void *producer( void *arg )
 {
     int item;
     
-    log_msg( LOG_INFO, "Producer started (PID %d)", getpid() );
+    log_msg( LOG_INFO, "Producer started (TID %lu)", pthread_self() );
 
     for ( int i = 0; i < 20; i++ )  /* produce 20 items */
     {
@@ -217,14 +202,14 @@ void producer( void )
         if ( sem_wait( g_sem_empty ) < 0 )
         {
             log_msg( LOG_ERROR, "sem_wait(empty) failed" );
-            exit( 1 );
+            pthread_exit( nullptr );
         }
         
         /* down(&mutex) */
         if ( sem_wait( g_sem_mutex ) < 0 )
         {
             log_msg( LOG_ERROR, "sem_wait(mutex) failed" );
-            exit( 1 );
+            pthread_exit( nullptr );
         }
         
         /* insert item into buffer */
@@ -235,28 +220,29 @@ void producer( void )
         if ( sem_post( g_sem_mutex ) < 0 )
         {
             log_msg( LOG_ERROR, "sem_post(mutex) failed" );
-            exit( 1 );
+            pthread_exit( nullptr );
         }
         
         /* up(&full) */
         if ( sem_post( g_sem_full ) < 0 )
         {
             log_msg( LOG_ERROR, "sem_post(full) failed" );
-            exit( 1 );
+            pthread_exit( nullptr );
         }
     }
     
     log_msg( LOG_INFO, "Producer finished" );
+    pthread_exit( nullptr );
 }
 
 //***************************************************************************
 // CONSUMER function from Figure 2-28
 
-void consumer( void )
+void *consumer( void *arg )
 {
     int item;
     
-    log_msg( LOG_INFO, "Consumer started (PID %d)", getpid() );
+    log_msg( LOG_INFO, "Consumer started (TID %lu)", pthread_self() );
 
     for ( int i = 0; i < 20; i++ )  /* consume 20 items */
     {
@@ -264,14 +250,14 @@ void consumer( void )
         if ( sem_wait( g_sem_full ) < 0 )
         {
             log_msg( LOG_ERROR, "sem_wait(full) failed" );
-            exit( 1 );
+            pthread_exit( nullptr );
         }
         
         /* down(&mutex) */
         if ( sem_wait( g_sem_mutex ) < 0 )
         {
             log_msg( LOG_ERROR, "sem_wait(mutex) failed" );
-            exit( 1 );
+            pthread_exit( nullptr );
         }
         
         /* remove item from buffer */
@@ -282,14 +268,14 @@ void consumer( void )
         if ( sem_post( g_sem_mutex ) < 0 )
         {
             log_msg( LOG_ERROR, "sem_post(mutex) failed" );
-            exit( 1 );
+            pthread_exit( nullptr );
         }
         
         /* up(&empty) */
         if ( sem_post( g_sem_empty ) < 0 )
         {
             log_msg( LOG_ERROR, "sem_post(empty) failed" );
-            exit( 1 );
+            pthread_exit( nullptr );
         }
         
         /* consume item */
@@ -298,6 +284,7 @@ void consumer( void )
     }
     
     log_msg( LOG_INFO, "Consumer finished" );
+    pthread_exit( nullptr );
 }
 
 //***************************************************************************
@@ -348,33 +335,16 @@ int main(int t_narg, char **t_args)
     log_msg( LOG_INFO, "Created full semaphore (initial value = 0)" );
 
     //***************************************************************
-    // create shared memory
+    // initialize shared data
     
-    log_msg(LOG_INFO, "Creating shared memory...");
-    
-    g_shmid = shmget( IPC_PRIVATE, sizeof(struct shared_data), IPC_CREAT | 0660 );
-    if ( g_shmid < 0 )
-    {
-        log_msg( LOG_ERROR, "Unable to create shared memory!" );
-        return 1;
-    }
-    
-    g_shared = (struct shared_data *)shmat( g_shmid, nullptr, 0 );
-    if ( g_shared == (void *)-1 )
-    {
-        log_msg( LOG_ERROR, "Unable to attach shared memory!" );
-        return 1;
-    }
-    
-    // initialize buffer
-    g_shared->in = 0;
-    g_shared->out = 0;
+    g_shared.in = 0;
+    g_shared.out = 0;
     for ( int i = 0; i < N; i++ )
     {
-        g_shared->buffer[i] = 0;
+        g_shared.buffer[i] = 0;
     }
     
-    log_msg( LOG_INFO, "Shared memory created and initialized" );
+    log_msg( LOG_INFO, "Shared data initialized" );
 
     //***************************************************************
     // setup signal handlers
@@ -394,92 +364,45 @@ int main(int t_narg, char **t_args)
     atexit(clean);
 
     //***************************************************************
-    // create producer process
+    // create producer thread
     
-    log_msg( LOG_INFO, "Creating producer process..." );
+    log_msg( LOG_INFO, "Creating producer thread..." );
     
-    pid_t producer_pid = fork();
+    pthread_t producer_thread;
     
-    if ( producer_pid < 0 )
+    if ( pthread_create( &producer_thread, nullptr, producer, nullptr ) != 0 )
     {
-        log_msg( LOG_ERROR, "fork() failed for producer" );
+        log_msg( LOG_ERROR, "pthread_create() failed for producer" );
         return 1;
-    }
-    
-    if ( producer_pid == 0 )
-    {
-        // child process - PRODUCER
-        
-        // open semaphores (they already exist)
-        g_sem_mutex = sem_open( SEM_MUTEX_NAME, O_RDWR );
-        g_sem_empty = sem_open( SEM_EMPTY_NAME, O_RDWR );
-        g_sem_full = sem_open( SEM_FULL_NAME, O_RDWR );
-        
-        // attach to existing shared memory
-        g_shared = (struct shared_data *)shmat( g_shmid, nullptr, 0 );
-        
-        // run producer
-        producer();
-        
-        // detach from shared memory
-        shmdt( g_shared );
-        
-        // child exits
-        exit(0);
     }
 
     //***************************************************************
-    // create consumer process
+    // create consumer thread
     
-    log_msg( LOG_INFO, "Creating consumer process..." );
+    log_msg( LOG_INFO, "Creating consumer thread..." );
     
-    pid_t consumer_pid = fork();
+    pthread_t consumer_thread;
     
-    if ( consumer_pid < 0 )
+    if ( pthread_create( &consumer_thread, nullptr, consumer, nullptr ) != 0 )
     {
-        log_msg( LOG_ERROR, "fork() failed for consumer" );
+        log_msg( LOG_ERROR, "pthread_create() failed for consumer" );
         return 1;
-    }
-    
-    if ( consumer_pid == 0 )
-    {
-        // child process - CONSUMER
-        
-        // open semaphores (they already exist)
-        g_sem_mutex = sem_open( SEM_MUTEX_NAME, O_RDWR );
-        g_sem_empty = sem_open( SEM_EMPTY_NAME, O_RDWR );
-        g_sem_full = sem_open( SEM_FULL_NAME, O_RDWR );
-        
-        // attach to existing shared memory
-        g_shared = (struct shared_data *)shmat( g_shmid, nullptr, 0 );
-        
-        // run consumer
-        consumer();
-        
-        // detach from shared memory
-        shmdt(g_shared);
-        
-        // child exits
-        exit(0);
     }
 
     //***************************************************************
-    // parent waits for children
+    // wait for threads to finish
     
-    log_msg( LOG_INFO, "Parent waiting for children to finish..." );
-
-    // Wait for all
-    // waitpid(-1, nullptr, 0);
+    log_msg( LOG_INFO, "Main thread waiting for threads to finish..." );
     
     // wait for producer
-    waitpid( producer_pid, nullptr, 0 );
-    log_msg( LOG_INFO, "Producer process finished" );
+    pthread_join( producer_thread, nullptr );
+    log_msg( LOG_INFO, "Producer thread finished" );
     
     // wait for consumer
-    waitpid( consumer_pid, nullptr, 0 );
-    log_msg( LOG_INFO, "Consumer process finished" );
+    pthread_join( consumer_thread, nullptr );
+    log_msg( LOG_INFO, "Consumer thread finished" );
     
-    log_msg( LOG_INFO, "All processes finished successfully!" );
+    log_msg( LOG_INFO, "All threads finished successfully!" );
     
     return 0;
 }
