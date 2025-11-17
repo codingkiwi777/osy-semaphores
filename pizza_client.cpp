@@ -1,6 +1,6 @@
 //***************************************************************************
 //
-// Pizza Client - Can be pekar (producer) or zakaznik (consumer)
+// Pizza Client - can be pekar (producer) or zakaznik (consumer)
 //
 //***************************************************************************
 
@@ -16,8 +16,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
-#include <pthread.h>
 #include <time.h>
+#include <sys/wait.h>
 
 //***************************************************************************
 // log messages
@@ -64,14 +64,12 @@ void log_msg( int t_log_level, const char *t_form, ... )
 int g_sock_server = -1;
 
 //***************************************************************************
-// pekar thread - sends pizza names to server
+// pekar process - sends pizza names to server
 
-void *pekar_thread( void *arg )
+void pekar_process( int count )
 {
-    int count = *((int*)arg);
-    delete (int*)arg;
-    
-    const char* pizza_names[] = {
+    const char* pizza_names[] = 
+    {
         "Margherita",
         "Prosciutto", 
         "Capricciosa",
@@ -84,7 +82,7 @@ void *pekar_thread( void *arg )
     
     int num_pizzas = sizeof(pizza_names) / sizeof(pizza_names[0]);
     
-    log_msg( LOG_INFO, "Pekar thread started, will send %d pizzas", count );
+    log_msg( LOG_INFO, "Pekar process started (PID %d), will send %d pizzas", getpid(), count );
     
     for ( int i = 0; i < count; i++ )
     {
@@ -110,16 +108,15 @@ void *pekar_thread( void *arg )
         log_msg( LOG_DEBUG, "Received confirmation: %s", buf );
     }
     
-    log_msg( LOG_INFO, "Pekar thread finished" );
-    pthread_exit( nullptr );
+    log_msg( LOG_INFO, "Pekar process finished (PID %d)", getpid() );
 }
 
 //***************************************************************************
-// zakaznik thread - receives pizza names from server
+// zakaznik process - receives pizza names from server
 
-void *zakaznik_thread( void *arg )
+void zakaznik_process( void )
 {
-    log_msg( LOG_INFO, "Zakaznik thread started" );
+    log_msg( LOG_INFO, "Zakaznik process started (PID %d)", getpid() );
     
     while (1)
     {
@@ -146,8 +143,7 @@ void *zakaznik_thread( void *arg )
         write( g_sock_server, ok_msg, strlen(ok_msg) );
     }
     
-    log_msg( LOG_INFO, "Zakaznik thread finished" );
-    pthread_exit( nullptr );
+    log_msg( LOG_INFO, "Zakaznik process finished (PID %d)", getpid() );
 }
 
 //***************************************************************************
@@ -272,8 +268,7 @@ int main( int t_narg, char **t_args )
         write( g_sock_server, role_msg, strlen(role_msg) );
         log_msg( LOG_INFO, "Sent role: %s", role );
         
-        // create thread based on role
-        pthread_t thread_id;
+        // create process based on role
         
         if ( strcmp( role, "pekar" ) == 0 )
         {
@@ -296,15 +291,47 @@ int main( int t_narg, char **t_args )
                     break;
                 }
                 
-                int* count_ptr = new int(count);
-                pthread_create( &thread_id, nullptr, pekar_thread, (void*)count_ptr );
-                pthread_join( thread_id, nullptr );
+                // fork process for pekar
+                pid_t pid = fork();
+                
+                if ( pid == 0 )
+                {
+                    // child process - pekar
+                    pekar_process( count );
+                    exit(0);
+                }
+                else if ( pid > 0 )
+                {
+                    // parent - wait for child to finish
+                    waitpid( pid, nullptr, 0 );
+                }
+                else
+                {
+                    log_msg( LOG_ERROR, "Fork failed for pekar!" );
+                    break;
+                }
             }
         }
         else if ( strcmp( role, "zakaznik" ) == 0 )
         {
-            pthread_create( &thread_id, nullptr, zakaznik_thread, nullptr );
-            pthread_join( thread_id, nullptr );
+            // fork process for zakaznik
+            pid_t pid = fork();
+            
+            if ( pid == 0 )
+            {
+                // child process - zakaznik
+                zakaznik_process();
+                exit(0);
+            }
+            else if ( pid > 0 )
+            {
+                // parent - wait for child to finish
+                waitpid( pid, nullptr, 0 );
+            }
+            else
+            {
+                log_msg( LOG_ERROR, "Fork failed for zakaznik!" );
+            }
         }
         else
         {

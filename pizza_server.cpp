@@ -1,8 +1,22 @@
 //***************************************************************************
 //
-// Pizza Server
+// Pizza Server - Producer-Consumer using shared memory and processes
 //
 //***************************************************************************
+
+/*
+    # Spuštění serveru (terminál 1)
+    ./pizza_server 12345
+
+    # Spuštění pekařů (terminál 2, 3, ...)
+    ./pizza_client 127.0.0.1 12345
+    # Zadej: pekar
+    # Zadej počet pizz: 7
+
+    # Spuštění zákazníků (terminál 4, 5, ...)
+    ./pizza_client 127.0.0.1 12345
+    # Zadej: zakaznik
+*/
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,12 +26,14 @@
 #include <stdarg.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
-#include <pthread.h>
 #include <semaphore.h>
 #include <signal.h>
+#include <sys/wait.h>
 
 //***************************************************************************
 // constants
@@ -28,6 +44,8 @@
 #define SEM_MUTEX_NAME      "/sem_pizza_mutex"
 #define SEM_EMPTY_NAME      "/sem_pizza_empty"
 #define SEM_FULL_NAME       "/sem_pizza_full"
+
+#define SHM_NAME            "/shm_pizza_queue"
 
 //***************************************************************************
 // log messages
@@ -70,7 +88,7 @@ void log_msg(int t_log_level, const char *t_form, ...)
 }
 
 //***************************************************************************
-// shared data structure - pizza queue
+// shared data structure - pizza queue in shared memory
 
 struct pizza_queue 
 {
@@ -86,7 +104,8 @@ sem_t *g_sem_mutex = nullptr;    // controls access to critical region
 sem_t *g_sem_empty = nullptr;    // counts empty buffer slots
 sem_t *g_sem_full = nullptr;     // counts full buffer slots
 
-struct pizza_queue g_queue;      // shared pizza queue
+struct pizza_queue *g_queue = nullptr;  // pointer to shared memory queue
+int g_shm_fd = -1;                      // shared memory file descriptor
 
 //***************************************************************************
 // producer function - inserts pizza into queue
@@ -108,10 +127,10 @@ void producer(char *pizza)
     }
     
     /* insert pizza into buffer */
-    strncpy( g_queue.buffer[ g_queue.in ], pizza, MAX_PIZZA_NAME - 1 );
-    g_queue.buffer[ g_queue.in ][ MAX_PIZZA_NAME - 1 ] = '\0';
-    log_msg( LOG_DEBUG, "Inserted pizza '%s' into queue at position %d", pizza, g_queue.in );
-    g_queue.in = ( g_queue.in + 1 ) % N;
+    strncpy( g_queue->buffer[ g_queue->in ], pizza, MAX_PIZZA_NAME - 1 );
+    g_queue->buffer[ g_queue->in ][ MAX_PIZZA_NAME - 1 ] = '\0';
+    log_msg( LOG_DEBUG, "Inserted pizza '%s' into queue at position %d", pizza, g_queue->in );
+    g_queue->in = ( g_queue->in + 1 ) % N; // for cyclic buffer
     
     /* up(&mutex) */
     if ( sem_post( g_sem_mutex ) < 0 )
@@ -148,10 +167,10 @@ void consumer(char *pizza_out)
     }
     
     /* remove pizza from buffer */
-    strncpy( pizza_out, g_queue.buffer[ g_queue.out ], MAX_PIZZA_NAME - 1 );
+    strncpy( pizza_out, g_queue->buffer[ g_queue->out ], MAX_PIZZA_NAME - 1 );
     pizza_out[ MAX_PIZZA_NAME - 1 ] = '\0';
-    log_msg( LOG_DEBUG, "Removed pizza '%s' from queue at position %d", pizza_out, g_queue.out );
-    g_queue.out = ( g_queue.out + 1 ) % N;
+    log_msg( LOG_DEBUG, "Removed pizza '%s' from queue at position %d", pizza_out, g_queue->out );
+    g_queue->out = ( g_queue->out + 1 ) % N; // for cyclic buffer
     
     /* up(&mutex) */
     if ( sem_post( g_sem_mutex ) < 0 )
@@ -174,6 +193,19 @@ void consumer(char *pizza_out)
 void clean(void)
 {
     log_msg(LOG_INFO, "Final cleaning ...");
+
+    // unmap shared memory
+    if (g_queue)
+    {
+        munmap(g_queue, sizeof(struct pizza_queue));
+    }
+    
+    // close and unlink shared memory
+    if (g_shm_fd != -1)
+    {
+        close(g_shm_fd);
+        shm_unlink(SHM_NAME);
+    }
 
     // clean semaphores
     if (g_sem_mutex)
@@ -202,14 +234,55 @@ void catch_sig(int t_sig)
 }
 
 //***************************************************************************
-// client thread function
+// client process function
 
-void *client_thread( void *arg )
+void client_process( int sock_client )
 {
-    int sock_client = *((int*)arg);
-    delete (int*)arg;
-    
     char buf[128];
+    
+    // open existing semaphores
+    g_sem_mutex = sem_open( SEM_MUTEX_NAME, 0 );
+    if ( !g_sem_mutex )
+    {
+        log_msg( LOG_ERROR, "Unable to open mutex semaphore in child!" );
+        exit(1);
+    }
+    
+    g_sem_empty = sem_open( SEM_EMPTY_NAME, 0 );
+    if ( !g_sem_empty )
+    {
+        log_msg( LOG_ERROR, "Unable to open empty semaphore in child!" );
+        exit(1);
+    }
+    
+    g_sem_full = sem_open( SEM_FULL_NAME, 0 );
+    if ( !g_sem_full )
+    {
+        log_msg( LOG_ERROR, "Unable to open full semaphore in child!" );
+        exit(1);
+    }
+    
+    // open existing shared memory
+    g_shm_fd = shm_open( SHM_NAME, O_RDWR, 0660 );
+    if ( g_shm_fd < 0 )
+    {
+        log_msg( LOG_ERROR, "Unable to open shared memory in child!" );
+        exit(1);
+    }
+    
+    // map shared memory
+    g_queue = (struct pizza_queue*) mmap( nullptr, 
+                                          sizeof(struct pizza_queue), 
+                                          PROT_READ | PROT_WRITE, 
+                                          MAP_SHARED, 
+                                          g_shm_fd, 
+                                          0
+                                        );
+    if ( g_queue == MAP_FAILED )
+    {
+        log_msg( LOG_ERROR, "Unable to map shared memory in child!" );
+        exit(1);
+    }
     
     // send role question
     const char* role_question = "Role?\n";
@@ -222,7 +295,7 @@ void *client_thread( void *arg )
     {
         log_msg( LOG_ERROR, "Failed to read role from client" );
         close( sock_client );
-        pthread_exit( nullptr );
+        exit(1);
     }
     
     buf[l_len] = '\0';
@@ -230,12 +303,12 @@ void *client_thread( void *arg )
     if ( buf[l_len - 1] == '\n' )
         buf[l_len - 1] = '\0';
     
-    log_msg( LOG_INFO, "Client (socket %d) chose role: %s", sock_client, buf );
+    log_msg( LOG_INFO, "Client (socket %d, PID %d) chose role: %s", sock_client, getpid(), buf );
     
     // pekar (producer)
     if ( strcmp( buf, "pekar" ) == 0 )
     {
-        log_msg( LOG_INFO, "Starting pekar thread for socket %d", sock_client );
+        log_msg( LOG_INFO, "Starting pekar process (PID %d)", getpid() );
         
         while (1)
         {
@@ -243,7 +316,7 @@ void *client_thread( void *arg )
             l_len = read( sock_client, buf, sizeof(buf) - 1 );
             if ( l_len <= 0 )
             {
-                log_msg( LOG_INFO, "Pekar (socket %d) disconnected", sock_client );
+                log_msg( LOG_INFO, "Pekar (PID %d) disconnected", getpid() );
                 break;
             }
             
@@ -252,7 +325,7 @@ void *client_thread( void *arg )
             if ( buf[l_len - 1] == '\n' )
                 buf[l_len - 1] = '\0';
             
-            log_msg( LOG_INFO, "Pekar sends pizza: %s", buf );
+            log_msg( LOG_INFO, "Pekar (PID %d) sends pizza: %s", getpid(), buf );
             
             // insert pizza into queue using producer()
             producer( buf );
@@ -265,7 +338,7 @@ void *client_thread( void *arg )
     // zakaznik (consumer)
     else if ( strcmp( buf, "zakaznik" ) == 0 )
     {
-        log_msg( LOG_INFO, "Starting zakaznik thread for socket %d", sock_client );
+        log_msg( LOG_INFO, "Starting zakaznik process (PID %d)", getpid() );
         
         while (1)
         {
@@ -274,7 +347,7 @@ void *client_thread( void *arg )
             // get pizza from queue using consumer()
             consumer( pizza_name );
             
-            log_msg( LOG_INFO, "Zakaznik receives pizza: %s", pizza_name );
+            log_msg( LOG_INFO, "Zakaznik (PID %d) receives pizza: %s", getpid(), pizza_name );
             
             // send pizza name to client
             char pizza_msg[MAX_PIZZA_NAME + 2];
@@ -285,12 +358,12 @@ void *client_thread( void *arg )
             l_len = read( sock_client, buf, sizeof(buf) - 1 );
             if ( l_len <= 0 )
             {
-                log_msg( LOG_INFO, "Zakaznik (socket %d) disconnected", sock_client );
+                log_msg( LOG_INFO, "Zakaznik (PID %d) disconnected", getpid() );
                 break;
             }
             
             buf[l_len] = '\0';
-            log_msg( LOG_DEBUG, "Zakaznik sent confirmation: %s", buf );
+            log_msg( LOG_DEBUG, "Zakaznik (PID %d) sent confirmation: %s", getpid(), buf );
         }
     }
     else
@@ -298,9 +371,16 @@ void *client_thread( void *arg )
         log_msg( LOG_ERROR, "Unknown role: %s", buf );
     }
     
+    // cleanup
+    munmap( g_queue, sizeof(struct pizza_queue) );
+    close( g_shm_fd );
+    sem_close( g_sem_mutex );
+    sem_close( g_sem_empty );
+    sem_close( g_sem_full );
     close( sock_client );
-    log_msg( LOG_INFO, "Client thread finished (socket %d)", sock_client );
-    pthread_exit( nullptr );
+    
+    log_msg( LOG_INFO, "Client process finished (PID %d)", getpid() );
+    exit(0);
 }
 
 //***************************************************************************
@@ -312,12 +392,13 @@ void help(int t_narg, char **t_args)
     {
         printf(
             "\n"
-            "  Pizza Server - Producer-Consumer problem.\n"
+            "  Pizza Server - Producer-Consumer with shared memory.\n"
             "\n"
-            "  Use: %s [-d -h] port_number\n"
+            "  Use: %s [-d -h -r] port_number\n"
             "\n"
             "    -h  this help\n"
             "    -d  debug mode \n"
+            "    -r  clean semaphores and shared memory\n"
             "\n", t_args[0]
         );
         exit(0);
@@ -325,6 +406,16 @@ void help(int t_narg, char **t_args)
 
     if ( !strcmp( t_args[1], "-d" ) )
         g_debug = LOG_DEBUG;
+        
+    if ( !strcmp( t_args[1], "-r" ) )
+    {
+        log_msg( LOG_INFO, "Clean semaphores and shared memory." );
+        sem_unlink( SEM_MUTEX_NAME );
+        sem_unlink( SEM_EMPTY_NAME );
+        sem_unlink( SEM_FULL_NAME );
+        shm_unlink( SHM_NAME );
+        exit(0);
+    }
 }
 
 //***************************************************************************
@@ -347,6 +438,16 @@ int main(int t_narg, char **t_args)
 
         if ( !strcmp( t_args[ i ], "-h" ) )
             help( t_narg, t_args );
+            
+        if ( !strcmp( t_args[ i ], "-r" ) )
+        {
+            log_msg( LOG_INFO, "Clean semaphores and shared memory." );
+            sem_unlink( SEM_MUTEX_NAME );
+            sem_unlink( SEM_EMPTY_NAME );
+            sem_unlink( SEM_FULL_NAME );
+            shm_unlink( SHM_NAME );
+            exit(0);
+        }
 
         if ( *t_args[ i ] != '-' && !l_port )
         {
@@ -362,11 +463,12 @@ int main(int t_narg, char **t_args)
     }
 
     //***************************************************************
-    // clean old semaphores first
+    // clean old semaphores and shared memory first
     
     sem_unlink( SEM_MUTEX_NAME );
     sem_unlink( SEM_EMPTY_NAME );
     sem_unlink( SEM_FULL_NAME );
+    shm_unlink( SHM_NAME );
 
     //***************************************************************
     // create semaphores
@@ -401,13 +503,49 @@ int main(int t_narg, char **t_args)
     log_msg( LOG_INFO, "Created full semaphore (initial value = 0)" );
 
     //***************************************************************
+    // create and initialize shared memory
+    
+    log_msg( LOG_INFO, "Creating shared memory..." );
+    
+    // create shared memory object
+    g_shm_fd = shm_open( SHM_NAME, O_RDWR | O_CREAT, 0660 );
+    if ( g_shm_fd < 0 )
+    {
+        log_msg( LOG_ERROR, "Unable to create shared memory!" );
+        return 1;
+    }
+    
+    // set size of shared memory
+    if ( ftruncate( g_shm_fd, sizeof(struct pizza_queue) ) < 0 )
+    {
+        log_msg( LOG_ERROR, "Unable to set size of shared memory!" );
+        return 1;
+    }
+    
+    // map shared memory
+    g_queue = (struct pizza_queue*) mmap( nullptr, 
+                                          sizeof(struct pizza_queue), 
+                                          PROT_READ | PROT_WRITE, 
+                                          MAP_SHARED, 
+                                          g_shm_fd, 
+                                          0 
+                                        );
+    if ( g_queue == MAP_FAILED )
+    {
+        log_msg( LOG_ERROR, "Unable to map shared memory!" );
+        return 1;
+    }
+    
+    log_msg( LOG_INFO, "Shared memory created and mapped" );
+    
+    //***************************************************************
     // initialize shared queue
     
-    g_queue.in = 0;
-    g_queue.out = 0;
+    g_queue->in = 0;
+    g_queue->out = 0;
     for ( int i = 0; i < N; i++ )
     {
-        g_queue.buffer[i][0] = '\0';
+        g_queue->buffer[i][0] = '\0';
     }
     
     log_msg( LOG_INFO, "Pizza queue initialized (capacity = %d)", N );
@@ -439,7 +577,7 @@ int main(int t_narg, char **t_args)
     if ( l_sock_listen == -1 )
     {
         log_msg( LOG_ERROR, "Unable to create socket.");
-        exit(1);
+        exit( 1 );
     }
 
     in_addr l_addr_any = { INADDR_ANY };
@@ -472,7 +610,7 @@ int main(int t_narg, char **t_args)
     log_msg( LOG_INFO, "Server started. Waiting for clients..." );
 
     //***************************************************************
-    // main loop - accept clients
+    // main loop - accept clients and create processes
 
     while (1)
     {
@@ -491,21 +629,29 @@ int main(int t_narg, char **t_args)
         log_msg( LOG_INFO, "New client connected from %s:%d", 
                  inet_ntoa( l_rsa.sin_addr ), ntohs( l_rsa.sin_port ) );
 
-        // create thread for new client
-        pthread_t thread_id;
-        int* sock_ptr = new int( new_sock );
+        // fork new process for client
+        pid_t pid = fork();
         
-        int err = pthread_create( &thread_id, nullptr, client_thread, (void*)sock_ptr );
-        if ( err )
+        if ( pid == 0 )
         {
-            log_msg( LOG_ERROR, "Unable to create thread for client!" );
-            close( new_sock );
-            delete sock_ptr;
+            // child process
+            close( l_sock_listen );  // child doesnt need listening socket
+            client_process( new_sock );
+            exit(0);
+        }
+        else if ( pid > 0 )
+        {
+            // parent process
+            close( new_sock );  // parent doesn't need client socket
+            log_msg( LOG_DEBUG, "Created process (PID %d) for client", pid );
+            
+            // clean up zombie processes
+            while ( waitpid( -1, nullptr, WNOHANG ) > 0 );
         }
         else
         {
-            pthread_detach( thread_id );
-            log_msg( LOG_DEBUG, "Thread created for client (socket %d)", new_sock );
+            log_msg( LOG_ERROR, "Unable to fork process for client!" );
+            close( new_sock );
         }
     }
 
