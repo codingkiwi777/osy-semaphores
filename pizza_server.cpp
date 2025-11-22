@@ -1,6 +1,7 @@
 //***************************************************************************
 //
 // Pizza Server - Producer-Consumer using shared memory and processes
+// Buffer jako prepravka (az se naplni, odesle se zakaznikovi)
 //
 //***************************************************************************
 
@@ -8,14 +9,13 @@
     # Spuštění serveru (terminál 1)
     ./pizza_server 12345
 
-    # Spuštění pekařů (terminál 2, 3, ...)
+    # Spuštění klientů (terminál 2, 3, ...)
     ./pizza_client 127.0.0.1 12345
-    # Zadej: pekar
-    # Zadej počet pizz: 7
-
-    # Spuštění zákazníků (terminál 4, 5, ...)
-    ./pizza_client 127.0.0.1 12345
-    # Zadej: zakaznik
+    # Server automaticky přidělí roli:
+    # - 1. klient (lichý) = pekar
+    # - 2. klient (sudý) = zakaznik
+    # - 3. klient (lichý) = pekar
+    # - atd.
 */
 
 #include <stdio.h>
@@ -34,11 +34,12 @@
 #include <semaphore.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <time.h>
 
 //***************************************************************************
 // constants
 
-#define N 10                        // number of slots in the pizza queue
+#define N 10                        // number of slots in the pizza queue (prepravka)
 #define MAX_PIZZA_NAME 64           // max pizza name length
 
 #define SEM_MUTEX_NAME      "/sem_pizza_mutex"
@@ -88,31 +89,31 @@ void log_msg(int t_log_level, const char *t_form, ...)
 }
 
 //***************************************************************************
-// shared data structure - pizza queue in shared memory
+// shared data structure - pizza queue in shared memory (prepravka)
 
 struct pizza_queue 
 {
     char buffer[N][MAX_PIZZA_NAME];  // the buffer for pizza names
-    int in;                          // index for producer (pekar)
-    int out;                         // index for consumer (zakaznik)
+    int state;                       // current number of items in prepravka (0 to N)
+    int item_counter;                // global counter for numbering pizzas
 };
 
 //***************************************************************************
 // global variables
 
 sem_t *g_sem_mutex = nullptr;    // controls access to critical region
-sem_t *g_sem_empty = nullptr;    // counts empty buffer slots
-sem_t *g_sem_full = nullptr;     // counts full buffer slots
+sem_t *g_sem_empty = nullptr;    // binary: 1 = prepravka is not full (pekar can add)
+sem_t *g_sem_full = nullptr;     // binary: 1 = prepravka is full (zakaznik can take)
 
 struct pizza_queue *g_queue = nullptr;  // pointer to shared memory queue
 int g_shm_fd = -1;                      // shared memory file descriptor
 
 //***************************************************************************
-// producer function - inserts pizza into queue
+// insert_item function - inserts pizza into prepravka with numbering
 
-void producer(char *pizza)
+void insert_item( char *pizza )
 {
-    /* down(&empty) */
+    /* down(&empty) - wait until prepravka is not full */
     if ( sem_wait( g_sem_empty ) < 0 )
     {
         log_msg( LOG_ERROR, "sem_wait(empty) failed" );
@@ -126,11 +127,12 @@ void producer(char *pizza)
         return;
     }
     
-    /* insert pizza into buffer */
-    strncpy( g_queue->buffer[ g_queue->in ], pizza, MAX_PIZZA_NAME - 1 );
-    g_queue->buffer[ g_queue->in ][ MAX_PIZZA_NAME - 1 ] = '\0';
-    log_msg( LOG_DEBUG, "Inserted pizza '%s' into queue at position %d", pizza, g_queue->in );
-    g_queue->in = ( g_queue->in + 1 ) % N; // for cyclic buffer
+    /* insert pizza into buffer with numbering: "N. item" */
+    g_queue->item_counter++;
+    sprintf( g_queue->buffer[ g_queue->state ], "%d. %s", g_queue->item_counter, pizza );
+    log_msg( LOG_DEBUG, "Inserted pizza '%s' into prepravka at position %d", 
+             g_queue->buffer[ g_queue->state ], g_queue->state );
+    g_queue->state++;
     
     /* up(&mutex) */
     if ( sem_post( g_sem_mutex ) < 0 )
@@ -139,20 +141,33 @@ void producer(char *pizza)
         return;
     }
     
-    /* up(&full) */
-    if ( sem_post( g_sem_full ) < 0 )
+    /* if prepravka is full, signal zakaznik, else signal pekar can continue */
+    if ( g_queue->state == N )
     {
-        log_msg( LOG_ERROR, "sem_post(full) failed" );
-        return;
+        /* up(&full) - prepravka is full, zakaznik can take it */
+        if ( sem_post( g_sem_full ) < 0 )
+        {
+            log_msg( LOG_ERROR, "sem_post(full) failed" );
+            return;
+        }
+    }
+    else
+    {
+        /* up(&empty) - prepravka is not full yet, pekar can continue */
+        if ( sem_post( g_sem_empty ) < 0 )
+        {
+            log_msg( LOG_ERROR, "sem_post(empty) failed" );
+            return;
+        }
     }
 }
 
 //***************************************************************************
-// consumer function - removes pizza from queue
+// remove_item function - removes ALL pizzas from prepravka (cela paleta)
 
-void consumer(char *pizza_out)
+void remove_item( char pizza_out[N][MAX_PIZZA_NAME], int *count )
 {
-    /* down(&full) */
+    /* down(&full) - wait until prepravka is full */
     if ( sem_wait( g_sem_full ) < 0 )
     {
         log_msg( LOG_ERROR, "sem_wait(full) failed" );
@@ -166,11 +181,15 @@ void consumer(char *pizza_out)
         return;
     }
     
-    /* remove pizza from buffer */
-    strncpy( pizza_out, g_queue->buffer[ g_queue->out ], MAX_PIZZA_NAME - 1 );
-    pizza_out[ MAX_PIZZA_NAME - 1 ] = '\0';
-    log_msg( LOG_DEBUG, "Removed pizza '%s' from queue at position %d", pizza_out, g_queue->out );
-    g_queue->out = ( g_queue->out + 1 ) % N; // for cyclic buffer
+    /* remove ALL pizzas from buffer (cela paleta) */
+    *count = g_queue->state;
+    for ( int i = 0; i < g_queue->state; i++ )
+    {
+        strncpy( pizza_out[i], g_queue->buffer[i], MAX_PIZZA_NAME - 1 );
+        pizza_out[i][ MAX_PIZZA_NAME - 1 ] = '\0';
+        log_msg( LOG_DEBUG, "Removed pizza '%s' from prepravka at position %d", pizza_out[i], i );
+    }
+    g_queue->state = 0;  // prepravka is now empty
     
     /* up(&mutex) */
     if ( sem_post( g_sem_mutex ) < 0 )
@@ -179,6 +198,7 @@ void consumer(char *pizza_out)
         return;
     }
     
+    /* prepravka is now empty, pekar can add */
     /* up(&empty) */
     if ( sem_post( g_sem_empty ) < 0 )
     {
@@ -230,15 +250,15 @@ void clean(void)
 // catch signal = for example CTRL+C sig (signal)
 void catch_sig(int t_sig)
 {
-  exit(1);
+    exit(1);
 }
 
 //***************************************************************************
 // client process function
 
-void client_process( int sock_client )
+void client_process( int sock_client, int client_number )
 {
-    char buf[128];
+    char buf[256];
     
     // open existing semaphores
     g_sem_mutex = sem_open( SEM_MUTEX_NAME, 0 );
@@ -284,36 +304,34 @@ void client_process( int sock_client )
         exit(1);
     }
     
-    // send role question
-    const char* role_question = "Role?\n";
-    write( sock_client, role_question, strlen(role_question) );
-    log_msg( LOG_INFO, "Sent role question to client (socket %d)", sock_client );
-    
-    // read role answer
-    int l_len = read( sock_client, buf, sizeof(buf) - 1 );
-    if ( l_len <= 0 )
+    // determine role based on client_number (lichy = pekar, sudy = zakaznik)
+    const char* role;
+    if ( client_number % 2 == 1 )
     {
-        log_msg( LOG_ERROR, "Failed to read role from client" );
-        close( sock_client );
-        exit(1);
+        role = "pekar";
+    }
+    else
+    {
+        role = "zakaznik";
     }
     
-    buf[l_len] = '\0';
-    // remove newline
-    if ( buf[l_len - 1] == '\n' )
-        buf[l_len - 1] = '\0';
+    // send role to client (server assigns role, ignores client's choice)
+    char role_msg[64];
+    sprintf( role_msg, "Role: %s\n", role );
+    write( sock_client, role_msg, strlen(role_msg) );
+    log_msg( LOG_INFO, "Client #%d (socket %d, PID %d) assigned role: %s", 
+             client_number, sock_client, getpid(), role );
     
-    log_msg( LOG_INFO, "Client (socket %d, PID %d) chose role: %s", sock_client, getpid(), buf );
-    
-    // pekar (producer)
-    if ( strcmp( buf, "pekar" ) == 0 )
+    // pekar (producer) - lichy klient
+    // Server PRIJIMA pizzy od klienta a uklada je do fronty
+    if ( strcmp( role, "pekar" ) == 0 )
     {
-        log_msg( LOG_INFO, "Starting pekar process (PID %d)", getpid() );
+        log_msg( LOG_INFO, "Starting pekar handler (PID %d)", getpid() );
         
         while (1)
         {
             // read pizza name from client
-            l_len = read( sock_client, buf, sizeof(buf) - 1 );
+            int l_len = read( sock_client, buf, sizeof(buf) - 1 );
             if ( l_len <= 0 )
             {
                 log_msg( LOG_INFO, "Pekar (PID %d) disconnected", getpid() );
@@ -322,55 +340,64 @@ void client_process( int sock_client )
             
             buf[l_len] = '\0';
             // remove newline
-            if ( buf[l_len - 1] == '\n' )
-                buf[l_len - 1] = '\0';
+            buf[strcspn(buf, "\r\n")] = '\0';
             
-            log_msg( LOG_INFO, "Pekar (PID %d) sends pizza: %s", getpid(), buf );
+            if ( strlen(buf) == 0 )
+                continue;
             
-            // insert pizza into queue using producer()
-            producer( buf );
+            log_msg( LOG_INFO, "Pekar (PID %d) received pizza: %s", getpid(), buf );
             
-            // send OK confirmation
+            // insert pizza into prepravka
+            insert_item( buf );
+            
+            // send OK confirmation to client
             const char* ok_msg = "OK\n";
-            write( sock_client, ok_msg, strlen(ok_msg) );
+            int l_written = write( sock_client, ok_msg, strlen(ok_msg) );
+            if ( l_written <= 0 )
+            {
+                log_msg( LOG_INFO, "Pekar (PID %d) disconnected", getpid() );
+                break;
+            }
         }
     }
-    // zakaznik (consumer)
-    else if ( strcmp( buf, "zakaznik" ) == 0 )
+    // zakaznik (consumer) - sudy klient
+    // Server POSILA pizzy klientovi z fronty
+    else if ( strcmp( role, "zakaznik" ) == 0 )
     {
-        log_msg( LOG_INFO, "Starting zakaznik process (PID %d)", getpid() );
+        log_msg( LOG_INFO, "Starting zakaznik handler (PID %d)", getpid() );
         
         while (1)
         {
-            char pizza_name[MAX_PIZZA_NAME];
+            char pizzas[N][MAX_PIZZA_NAME];
+            int count = 0;
             
-            // get pizza from queue using consumer()
-            consumer( pizza_name );
+            // get whole prepravka (cela paleta)
+            remove_item( pizzas, &count );
             
-            log_msg( LOG_INFO, "Zakaznik (PID %d) receives pizza: %s", getpid(), pizza_name );
+            log_msg( LOG_INFO, "Zakaznik (PID %d) receives prepravka with %d pizzas", getpid(), count );
             
-            // send pizza name to client
-            char pizza_msg[MAX_PIZZA_NAME + 2];
-            sprintf( pizza_msg, "%s\n", pizza_name );
-            write( sock_client, pizza_msg, strlen(pizza_msg) );
+            // send all pizzas to client
+            char msg[1024];
+            sprintf( msg, "=== Prepravka (%d pizz) ===\n", count );
+            write( sock_client, msg, strlen(msg) );
             
-            // wait for OK confirmation from client
-            l_len = read( sock_client, buf, sizeof(buf) - 1 );
-            if ( l_len <= 0 )
+            for ( int i = 0; i < count; i++ )
             {
-                log_msg( LOG_INFO, "Zakaznik (PID %d) disconnected", getpid() );
-                break;
+                sprintf( msg, "%s\n", pizzas[i] );
+                int l_written = write( sock_client, msg, strlen(msg) );
+                if ( l_written <= 0 )
+                {
+                    log_msg( LOG_INFO, "Zakaznik (PID %d) disconnected", getpid() );
+                    goto cleanup;
+                }
             }
             
-            buf[l_len] = '\0';
-            log_msg( LOG_DEBUG, "Zakaznik (PID %d) sent confirmation: %s", getpid(), buf );
+            sprintf( msg, "=== Konec prepravky ===\n" );
+            write( sock_client, msg, strlen(msg) );
         }
     }
-    else
-    {
-        log_msg( LOG_ERROR, "Unknown role: %s", buf );
-    }
     
+cleanup:
     // cleanup
     munmap( g_queue, sizeof(struct pizza_queue) );
     close( g_shm_fd );
@@ -393,6 +420,7 @@ void help(int t_narg, char **t_args)
         printf(
             "\n"
             "  Pizza Server - Producer-Consumer with shared memory.\n"
+            "  Buffer jako prepravka (az se naplni, odesle se zakaznikovi).\n"
             "\n"
             "  Use: %s [-d -h -r] port_number\n"
             "\n"
@@ -426,6 +454,8 @@ int main(int t_narg, char **t_args)
         help(t_narg, t_args);
 
     log_msg( LOG_INFO, "Pizza Server starting..." );
+
+    srand(time(NULL));
 
     // port number from user
     int l_port = 0;
@@ -471,11 +501,11 @@ int main(int t_narg, char **t_args)
     shm_unlink( SHM_NAME );
 
     //***************************************************************
-    // create semaphores
+    // create semaphores - all binary now
     
     log_msg( LOG_INFO, "Creating semaphores..." );
 
-    // semaphore mutex = 1
+    // semaphore mutex = 1 (binary)
     g_sem_mutex = sem_open( SEM_MUTEX_NAME, O_RDWR | O_CREAT, 0660, 1 );
     if ( !g_sem_mutex )
     {
@@ -484,23 +514,23 @@ int main(int t_narg, char **t_args)
     }
     log_msg( LOG_INFO, "Created mutex semaphore (initial value = 1)" );
 
-    // semaphore empty = N
-    g_sem_empty = sem_open( SEM_EMPTY_NAME, O_RDWR | O_CREAT, 0660, N );
+    // semaphore empty = 1 (binary) - prepravka is empty, pekar can add
+    g_sem_empty = sem_open( SEM_EMPTY_NAME, O_RDWR | O_CREAT, 0660, 1 );
     if ( !g_sem_empty )
     {
         log_msg( LOG_ERROR, "Unable to create empty semaphore!" );
         return 1;
     }
-    log_msg( LOG_INFO, "Created empty semaphore (initial value = N = %d)", N );
+    log_msg( LOG_INFO, "Created empty semaphore (initial value = 1, binary)" );
 
-    // semaphore full = 0
+    // semaphore full = 0 (binary) - prepravka is not full yet
     g_sem_full = sem_open( SEM_FULL_NAME, O_RDWR | O_CREAT, 0660, 0 );
     if ( !g_sem_full )
     {
         log_msg( LOG_ERROR, "Unable to create full semaphore!" );
         return 1;
     }
-    log_msg( LOG_INFO, "Created full semaphore (initial value = 0)" );
+    log_msg( LOG_INFO, "Created full semaphore (initial value = 0, binary)" );
 
     //***************************************************************
     // create and initialize shared memory
@@ -539,16 +569,16 @@ int main(int t_narg, char **t_args)
     log_msg( LOG_INFO, "Shared memory created and mapped" );
     
     //***************************************************************
-    // initialize shared queue
+    // initialize shared queue (prepravka)
     
-    g_queue->in = 0;
-    g_queue->out = 0;
+    g_queue->state = 0;          // prepravka is empty
+    g_queue->item_counter = 0;   // start numbering from 0
     for ( int i = 0; i < N; i++ )
     {
         g_queue->buffer[i][0] = '\0';
     }
     
-    log_msg( LOG_INFO, "Pizza queue initialized (capacity = %d)", N );
+    log_msg( LOG_INFO, "Prepravka initialized (capacity = %d)", N );
 
     //***************************************************************
     // setup signal handlers
@@ -608,9 +638,12 @@ int main(int t_narg, char **t_args)
     }
 
     log_msg( LOG_INFO, "Server started. Waiting for clients..." );
+    log_msg( LOG_INFO, "Role assignment: odd client = pekar, even client = zakaznik" );
 
     //***************************************************************
     // main loop - accept clients and create processes
+    
+    int g_client_counter = 0;  // counter for client numbering
 
     while (1)
     {
@@ -626,8 +659,10 @@ int main(int t_narg, char **t_args)
             continue;
         }
 
-        log_msg( LOG_INFO, "New client connected from %s:%d", 
-                 inet_ntoa( l_rsa.sin_addr ), ntohs( l_rsa.sin_port ) );
+        g_client_counter++;
+        
+        log_msg( LOG_INFO, "New client #%d connected from %s:%d", 
+                 g_client_counter, inet_ntoa( l_rsa.sin_addr ), ntohs( l_rsa.sin_port ) );
 
         // fork new process for client
         pid_t pid = fork();
@@ -636,14 +671,14 @@ int main(int t_narg, char **t_args)
         {
             // child process
             close( l_sock_listen );  // child doesnt need listening socket
-            client_process( new_sock );
+            client_process( new_sock, g_client_counter );
             exit(0);
         }
         else if ( pid > 0 )
         {
             // parent process
             close( new_sock );  // parent doesn't need client socket
-            log_msg( LOG_DEBUG, "Created process (PID %d) for client", pid );
+            log_msg( LOG_DEBUG, "Created process (PID %d) for client #%d", pid, g_client_counter );
             
             // clean up zombie processes
             while ( waitpid( -1, nullptr, WNOHANG ) > 0 );

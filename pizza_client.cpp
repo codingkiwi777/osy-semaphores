@@ -1,6 +1,8 @@
 //***************************************************************************
 //
-// Pizza Client - can be pekar (producer) or zakaznik (consumer)
+// Pizza Client - role je pridelena serverem (lichy=pekar, sudy=zakaznik)
+// Pekar GENERUJE pizzy a posila je serveru
+// Zakaznik PRIJIMA pizzy od serveru
 //
 //***************************************************************************
 
@@ -64,10 +66,12 @@ void log_msg( int t_log_level, const char *t_form, ... )
 int g_sock_server = -1;
 
 //***************************************************************************
-// pekar process - sends pizza names to server
+// pekar process - GENERUJE pizzy a posila je serveru
 
-void pekar_process( int count )
+void pekar_process( void )
 {
+    log_msg( LOG_INFO, "Pekar process started (PID %d)", getpid() );
+    
     const char* pizza_names[] = 
     {
         "Margherita",
@@ -79,50 +83,31 @@ void pekar_process( int count )
         "Marinara",
         "Funghi"
     };
-    
     int num_pizzas = sizeof(pizza_names) / sizeof(pizza_names[0]);
-    
-    log_msg( LOG_INFO, "Pekar process started (PID %d), will send %d pizzas", getpid(), count );
-    
-    for ( int i = 0; i < count; i++ )
-    {
-        // select random pizza
-        int pizza_idx = rand() % num_pizzas;
-        char pizza_msg[128];
-        sprintf( pizza_msg, "%s\n", pizza_names[pizza_idx] );
-        
-        // send pizza name to server
-        write( g_sock_server, pizza_msg, strlen(pizza_msg) );
-        log_msg( LOG_INFO, "Sent pizza: %s", pizza_names[pizza_idx] );
-        
-        // wait for OK confirmation
-        char buf[128];
-        int l_len = read( g_sock_server, buf, sizeof(buf) - 1 );
-        if ( l_len <= 0 )
-        {
-            log_msg( LOG_ERROR, "Server disconnected" );
-            break;
-        }
-        
-        buf[l_len] = '\0';
-        log_msg( LOG_DEBUG, "Received confirmation: %s", buf );
-    }
-    
-    log_msg( LOG_INFO, "Pekar process finished (PID %d)", getpid() );
-}
-
-//***************************************************************************
-// zakaznik process - receives pizza names from server
-
-void zakaznik_process( void )
-{
-    log_msg( LOG_INFO, "Zakaznik process started (PID %d)", getpid() );
     
     while (1)
     {
-        char buf[128];
+        // wait 5 seconds before producing next pizza
+        sleep(5);
         
-        // read pizza name from server
+        // select random pizza
+        int pizza_idx = rand() % num_pizzas;
+        const char* pizza_name = pizza_names[pizza_idx];
+        
+        log_msg( LOG_INFO, "Pekar produces pizza: %s", pizza_name );
+        
+        // send pizza name to server
+        char pizza_msg[128];
+        sprintf( pizza_msg, "%s\n", pizza_name );
+        int l_written = write( g_sock_server, pizza_msg, strlen(pizza_msg) );
+        if ( l_written <= 0 )
+        {
+            log_msg( LOG_INFO, "Server disconnected" );
+            break;
+        }
+        
+        // wait for OK confirmation from server
+        char buf[128];
         int l_len = read( g_sock_server, buf, sizeof(buf) - 1 );
         if ( l_len <= 0 )
         {
@@ -131,16 +116,36 @@ void zakaznik_process( void )
         }
         
         buf[l_len] = '\0';
-        // remove newline
-        if ( buf[l_len - 1] == '\n' )
-            buf[l_len - 1] = '\0';
+        log_msg( LOG_DEBUG, "Received confirmation: %s", buf );
+
+        fflush(stdout);
+    }
+    
+    log_msg( LOG_INFO, "Pekar process finished (PID %d)", getpid() );
+}
+
+//***************************************************************************
+// zakaznik process - PRIJIMA pizzy od serveru (cela prepravka)
+
+void zakaznik_process( void )
+{
+    log_msg( LOG_INFO, "Zakaznik process started (PID %d)", getpid() );
+    
+    while (1)
+    {
+        char buf[1024];
         
-        // print received pizza
-        printf( "Received pizza: %s\n", buf );
+        // read prepravka info from server
+        int l_len = read( g_sock_server, buf, sizeof(buf) - 1 );
+        if ( l_len <= 0 )
+        {
+            log_msg( LOG_INFO, "Server disconnected" );
+            break;
+        }
         
-        // send OK confirmation
-        const char* ok_msg = "OK\n";
-        write( g_sock_server, ok_msg, strlen(ok_msg) );
+        buf[l_len] = '\0';
+        printf( "%s", buf );
+        fflush(stdout);
     }
     
     log_msg( LOG_INFO, "Zakaznik process finished (PID %d)", getpid() );
@@ -156,6 +161,9 @@ void help( int t_narg, char **t_args )
         printf(
             "\n"
             "  Pizza client.\n"
+            "  Role je pridelena serverem (lichy=pekar, sudy=zakaznik).\n"
+            "  Pekar generuje pizzy co 5 sekund a posila je serveru.\n"
+            "  Zakaznik prijima prepravky pizz od serveru.\n"
             "\n"
             "  Use: %s [-h -d] ip_or_name port_number\n"
             "\n"
@@ -174,7 +182,7 @@ void help( int t_narg, char **t_args )
 
 int main( int t_narg, char **t_args )
 {
-    srand(time(NULL));
+    srand(time(NULL) ^ getpid());  // different seed for each client
 
     if ( t_narg <= 2 )
         help( t_narg, t_args );
@@ -244,7 +252,7 @@ int main( int t_narg, char **t_args )
 
     log_msg( LOG_INFO, "Connected to server" );
 
-    // read role question from server
+    // read assigned role from server
     char buf[128];
     int l_len = read( g_sock_server, buf, sizeof(buf) - 1 );
     if ( l_len <= 0 )
@@ -254,89 +262,33 @@ int main( int t_narg, char **t_args )
     }
     
     buf[l_len] = '\0';
-    printf( "%s", buf );  // print "Role?\n"
+    printf( "%s", buf );  // print "Role: pekar\n" or "Role: zakaznik\n"
     
-    // read role from stdin
-    char role[32];
-    if ( fgets( role, sizeof(role), stdin ) )
+    // parse role from server response
+    char role[32] = {0};
+    if ( sscanf( buf, "Role: %31s", role ) != 1 )
     {
-        role[strcspn(role, "\n")] = 0;  // remove newline
-        
-        // send role to server
-        char role_msg[64];
-        sprintf( role_msg, "%s\n", role );
-        write( g_sock_server, role_msg, strlen(role_msg) );
-        log_msg( LOG_INFO, "Sent role: %s", role );
-        
-        // create process based on role
-        
-        if ( strcmp( role, "pekar" ) == 0 )
-        {
-            while (1)
-            {
-                // ask for number of pizzas
-                printf( "How many pizzas to produce? " );
-                fflush(stdout);
-                
-                int count;
-                if ( scanf( "%d", &count ) != 1 )
-                {
-                    log_msg( LOG_INFO, "Invalid input, exiting..." );
-                    break;
-                }
-                
-                if ( count <= 0 )
-                {
-                    log_msg( LOG_INFO, "Exiting pekar mode..." );
-                    break;
-                }
-                
-                // fork process for pekar
-                pid_t pid = fork();
-                
-                if ( pid == 0 )
-                {
-                    // child process - pekar
-                    pekar_process( count );
-                    exit(0);
-                }
-                else if ( pid > 0 )
-                {
-                    // parent - wait for child to finish
-                    waitpid( pid, nullptr, 0 );
-                }
-                else
-                {
-                    log_msg( LOG_ERROR, "Fork failed for pekar!" );
-                    break;
-                }
-            }
-        }
-        else if ( strcmp( role, "zakaznik" ) == 0 )
-        {
-            // fork process for zakaznik
-            pid_t pid = fork();
-            
-            if ( pid == 0 )
-            {
-                // child process - zakaznik
-                zakaznik_process();
-                exit(0);
-            }
-            else if ( pid > 0 )
-            {
-                // parent - wait for child to finish
-                waitpid( pid, nullptr, 0 );
-            }
-            else
-            {
-                log_msg( LOG_ERROR, "Fork failed for zakaznik!" );
-            }
-        }
-        else
-        {
-            log_msg( LOG_ERROR, "Unknown role: %s", role );
-        }
+        log_msg( LOG_ERROR, "Failed to parse role from server" );
+        exit( 1 );
+    }
+    
+    // remove newline from role if present
+    role[strcspn(role, "\n")] = 0;
+    
+    log_msg( LOG_INFO, "Server assigned role: %s", role );
+    
+    // start appropriate process based on assigned role
+    if ( strcmp( role, "pekar" ) == 0 )
+    {
+        pekar_process();
+    }
+    else if ( strcmp( role, "zakaznik" ) == 0 )
+    {
+        zakaznik_process();
+    }
+    else
+    {
+        log_msg( LOG_ERROR, "Unknown role: %s", role );
     }
 
     close( g_sock_server );
